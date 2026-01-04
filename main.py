@@ -1,8 +1,6 @@
-# Source - https://stackoverflow.com/a
-# Posted by tameTNT, modified by community. See post 'Timeline' for change history
-# Retrieved 2026-01-02, License - CC BY-SA 4.0
-
 import asyncio
+import threading
+import time
 
 from winrt.windows.media.control import \
     GlobalSystemMediaTransportControlsSessionManager as SessionManager
@@ -12,48 +10,79 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import io
 
+last_track = None
 
-async def get_media_info():
+async def handle_playback_changed(current_session):
+    """Callback handler for media playback changes"""
+    global last_track
+    
+    try:
+        print("Media change detected...")
+        info_dict, image_data = await get_media_info(current_session)
+        if info_dict:
+            if info_dict == last_track: # Prevent duplicates, weird behavior
+                return
+            display_media_info(info_dict, image_data)
+            last_track = info_dict
+    except Exception as e:
+        print(f"Error handling playback change: {e}")
+
+async def setup_handler():
+    loop = asyncio.get_running_loop()
     sessions = await SessionManager.request_async()
-
-    # This source_app_user_model_id check and if statement is optional
-    # Use it if you want to only get a certain player/program's media
-    # (e.g. only chrome.exe's media not any other program's).
-
-    # To get the ID, use a breakpoint() to run sessions.get_current_session()
-    # while the media you want to get is playing.
-    # Then set TARGET_ID to the string this call returns.
-
     current_session = sessions.get_current_session()
-    if current_session:  # there needs to be a media session running
-        # if current_session.source_app_user_model_id == TARGET_ID:
-            info = await current_session.try_get_media_properties_async()
+    if current_session:
+        def handler(sender, args):
+            asyncio.run_coroutine_threadsafe(handle_playback_changed(current_session), loop)
+        playback_event_token = current_session.add_media_properties_changed(handler)
+        return playback_event_token, current_session
+    return None, None
 
-            # song_attr[0] != '_' ignores system attributes
-            # list is ['album_artist', 'album_title', 'album_track_count', 'artist', 'as_', 'genres', 'playback_type', 'subtitle', 'thumbnail', 'title', 'track_number']
-            info_dict = {
-                  "album_artist": info.album_artist,
-                  "album_title": info.album_title,
-                  "album_track_count": info.album_track_count,
-                  "artist": info.artist,
-                  "genres": list(info.genres),
-                  "subtitle": info.subtitle,
-                  "title": info.title,
-                  "track_number": info.track_number
-            }
-
+async def get_media_info(current_session):
+    if current_session:
+        info = await current_session.try_get_media_properties_async()
+        
+        info_dict = {
+            "album_artist": info.album_artist,
+            "album_title": info.album_title,
+            "album_track_count": info.album_track_count,
+            "artist": info.artist,
+            "genres": list(info.genres),
+            "subtitle": info.subtitle,
+            "title": info.title,
+            "track_number": info.track_number
+        }
+        
+        image_data = None
+        if info.thumbnail:
             stream = await info.thumbnail.open_read_async()
             reader = DataReader(stream)
             await reader.load_async(stream.size)
             image_data = bytearray(stream.size)
             reader.read_bytes(image_data)
+        
+        return info_dict, image_data
+    return None, None
 
-            return info_dict, image_data
+def display_media_info(info_dict, image_data):
+    print("Current Media Info:")
+    print(info_dict)
+    
+    if image_data:
+        print("Thumbnail received")
+        image = Image.open(io.BytesIO(image_data))
+        image.show()
+
+async def main():
+    token, session = await setup_handler()
+    if token:
+        print("Media event listener active. Press Ctrl+C to exit.")
+        try:
+            while True:
+                await asyncio.sleep(5)
+        except KeyboardInterrupt:
+            session.remove_media_properties_changed(token)
+            print("Exiting...")
 
 if __name__ == '__main__':
-    current_media_info, current_media_image = asyncio.run(get_media_info())
-    print(current_media_info)
-    image = Image.open(io.BytesIO(current_media_image))
-    plt.imshow(image)
-    plt.axis('off')  # Hide axes
-    plt.show()
+    asyncio.run(main())
