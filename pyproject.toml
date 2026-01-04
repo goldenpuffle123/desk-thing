@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.8",
+    "pyserial>=3.5",
     "winrt-runtime==3.2.1",
     "winrt-windows-foundation==3.2.1",
     "winrt-windows-foundation-collections==3.2.1",

@@ -9,19 +9,41 @@ from winrt.windows.storage.streams import \
 import matplotlib.pyplot as plt
 from PIL import Image
 import io
+import queue
+import serial
 
 last_track = None
+serial_tx_queue = queue.Queue()
+
+def serial_tx(port="COM3", baud=9600):
+    while True:
+        try:
+            ser = serial.Serial(port, baud, timeout=0.1)
+            time.sleep(2)  # ESP32 reset
+            print("Serial connected")
+            while True:
+                msg = serial_tx_queue.get()
+                print("Sending to serial:", msg)
+                ser.write((msg + "\n").encode())
+
+        except Exception as e:
+            print("Serial error:", e)
+            time.sleep(2)  # retry
+
+def format_media_for_serial(info_dict):
+    return f"META|{info_dict['artist']}|{info_dict['title']}"
 
 async def handle_playback_changed(current_session):
     """Callback handler for media playback changes"""
     global last_track
-    
+    global serial_tx_queue
     try:
-        print("Media change detected...")
+        print("\nMedia change detected...")
         info_dict, image_data = await get_media_info(current_session)
         if info_dict:
             if info_dict == last_track: # Prevent duplicates, weird behavior
                 return
+            serial_tx_queue.put(format_media_for_serial(info_dict))
             display_media_info(info_dict, image_data)
             last_track = info_dict
     except Exception as e:
@@ -70,10 +92,11 @@ def display_media_info(info_dict, image_data):
     
     if image_data:
         print("Thumbnail received")
-        image = Image.open(io.BytesIO(image_data))
-        image.show()
+        # image = Image.open(io.BytesIO(image_data))
+        # image.show()
 
 async def main():
+    threading.Thread(target=serial_tx, daemon=True).start()
     token, session = await setup_handler()
     if token:
         print("Media event listener active. Press Ctrl+C to exit.")
