@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from packet_encoder import encode_art, encode_meta, ArtFormat
 
 from winrt.windows.media.control import \
     GlobalSystemMediaTransportControlsSessionManager as SessionManager
@@ -33,7 +34,7 @@ def serial_tx(port="COM3", baud=9600):
 def format_media_for_serial(info_dict):
     return f"META|{info_dict['artist']}|{info_dict['title']}"
 
-async def handle_playback_changed(current_session):
+async def handle_media_properties_changed(current_session):
     """Callback handler for media playback changes"""
     global last_track
     global serial_tx_queue
@@ -43,9 +44,17 @@ async def handle_playback_changed(current_session):
         if info_dict:
             if info_dict == last_track: # Prevent duplicates, weird behavior
                 return
-            serial_tx_queue.put(format_media_for_serial(info_dict))
-            display_media_info(info_dict, image_data)
-            last_track = info_dict
+            serial_tx_queue.put(
+                encode_meta(info_dict['title'], info_dict['artist'], info_dict['album_title'])
+            )
+        if image_data:
+            art_packets = encode_art(
+                image_data, ArtFormat.JPEG
+            )
+            for packet in art_packets:
+                serial_tx_queue.put(packet)
+        display_media_info(info_dict, image_data) # for demo on this computer
+        last_track = info_dict
     except Exception as e:
         print(f"Error handling playback change: {e}")
 
@@ -55,7 +64,7 @@ async def setup_handler():
     current_session = sessions.get_current_session()
     if current_session:
         def handler(sender, args):
-            asyncio.run_coroutine_threadsafe(handle_playback_changed(current_session), loop)
+            asyncio.run_coroutine_threadsafe(handle_media_properties_changed(current_session), loop)
         playback_event_token = current_session.add_media_properties_changed(handler)
         return playback_event_token, current_session
     return None, None
@@ -93,6 +102,9 @@ def display_media_info(info_dict, image_data):
     if image_data:
         print("Thumbnail received")
         # image = Image.open(io.BytesIO(image_data))
+        # image = image.resize((200, 200))
+        # w, h = image.size
+        # fmt = image.format
         # image.show()
 
 async def main():
