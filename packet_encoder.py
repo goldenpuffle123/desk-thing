@@ -1,6 +1,7 @@
 from PIL import Image
 import io
 from enum import IntEnum
+import numpy as np
 
 SOF = 0x7E
 META = 0x01
@@ -52,16 +53,28 @@ def encode_meta(title: str, artist: str, album: str) -> bytes:
 # 'track_number': 4
 
 class ArtFormat(IntEnum):
-    JPEG = 0x01
-    PNG = 0x02
-    RGB565 = 0x03
+    JPEG = 0
+    PNG = 1
+    RGB565 = 2
+
+def convert_image_to_rgb565(image_data: bytes, size: tuple) -> bytes:
+    image = Image.open(io.BytesIO(image_data)).convert("RGB")
+    image = image.resize(size, Image.BILINEAR)
+    arr = np.asarray(image, dtype=np.uint8)
+    r = (arr[:,:,0] >> 3).astype(np.uint16)
+    g = (arr[:,:,1] >> 2).astype(np.uint16)
+    b = (arr[:,:,2] >> 3).astype(np.uint16)
+    rgb565 = (r << 11) | (g << 5) | b
+    return rgb565.tobytes()
 
 def encode_art(image_data: bytes, format: int, chunk_size: int = 512, size: tuple = (240,240)) -> list[bytes]:
-    packets: list[bytes] = []
-    total_size = len(image_data)
+    # FORMAT NOT IMPLEMENTED YET!!!
+    image_data_rgb565 = convert_image_to_rgb565(image_data, size)
 
-    image = Image.open(io.BytesIO(image_data))
-    image = image.resize(size) #width, height
+    packets: list[bytes] = []
+    total_size = len(image_data_rgb565)
+
+    
 
     begin_payload = bytearray()
     begin_payload.extend(total_size.to_bytes(4, 'little'))
@@ -77,7 +90,7 @@ def encode_art(image_data: bytes, format: int, chunk_size: int = 512, size: tupl
     chunk_payload = bytearray()
     offset = 0
     while offset < total_size:
-        chunk = image_data[offset:offset+chunk_size]
+        chunk = image_data_rgb565[offset:offset+chunk_size]
         chunk_payload = bytearray()
         chunk_payload.extend(offset.to_bytes(4, 'little'))
         chunk_payload.extend(chunk)

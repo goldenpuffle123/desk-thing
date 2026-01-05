@@ -16,11 +16,9 @@ import serial
 last_track = None
 serial_tx_queue = queue.Queue()
 
-def serial_tx(port="COM3", baud=9600):
+def serial_tx(ser: serial.Serial):
     while True:
         try:
-            ser = serial.Serial(port, baud, timeout=0.1)
-            time.sleep(2)  # ESP32 reset
             print("Serial connected")
             while True:
                 msg = serial_tx_queue.get()
@@ -28,8 +26,18 @@ def serial_tx(port="COM3", baud=9600):
                 ser.write((msg + "\n").encode())
 
         except Exception as e:
-            print("Serial error:", e)
+            print("Serial tx error:", e)
             time.sleep(2)  # retry
+
+def serial_rx(ser: serial.Serial):
+    while True:
+        try:
+            ret = ser.readline().decode(errors="ignore").strip()
+            if ret:
+                print("[ESP32] ", ret)
+        except Exception as e:
+            print("Serial rx error:", e)
+            break
 
 def format_media_for_serial(info_dict):
     return f"META|{info_dict['artist']}|{info_dict['title']}"
@@ -49,7 +57,7 @@ async def handle_media_properties_changed(current_session):
             )
         if image_data:
             art_packets = encode_art(
-                image_data, ArtFormat.JPEG
+                image_data, ArtFormat.RGB565
             )
             for packet in art_packets:
                 serial_tx_queue.put(packet)
@@ -108,7 +116,11 @@ def display_media_info(info_dict, image_data):
         # image.show()
 
 async def main():
-    threading.Thread(target=serial_tx, daemon=True).start()
+    ser = serial.Serial('COM3', 9600, timeout=0.1)
+    time.sleep(2)  # wait for serial to initialize
+    threading.Thread(target=serial_tx, args=(ser,), daemon=True).start()
+    threading.Thread(target=serial_rx, args=(ser,), daemon=True).start()
+
     token, session = await setup_handler()
     if token:
         print("Media event listener active. Press Ctrl+C to exit.")
