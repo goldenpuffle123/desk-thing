@@ -30,13 +30,17 @@ def encode(msg_type: int, payload: bytes) -> bytes:
     return bytes(frame)
 
 def encode_meta(title: str, artist: str, album: str) -> bytes:
+    t = title.encode('utf-8')[:255]
+    a = artist.encode('utf-8')[:255]
+    al = album.encode('utf-8')[:255]
+
     meta = bytearray()
-    meta.append(len(title))
-    meta.extend(title.encode('utf-8'))
-    meta.append(len(artist))
-    meta.extend(artist.encode('utf-8'))
-    meta.append(len(album))
-    meta.extend(album.encode('utf-8'))
+    meta.append(len(t))
+    meta.extend(t)
+    meta.append(len(a))
+    meta.extend(a)
+    meta.append(len(al))
+    meta.extend(al)
     return encode(META, bytes(meta))
 
 # Format:
@@ -59,7 +63,7 @@ class ArtFormat(IntEnum):
 
 def convert_image_to_rgb565(image_data: bytes, size: tuple) -> bytes:
     image = Image.open(io.BytesIO(image_data)).convert("RGB")
-    image = image.resize(size, Image.BILINEAR)
+    image = image.resize(size)
     arr = np.asarray(image, dtype=np.uint8)
     r = (arr[:,:,0] >> 3).astype(np.uint16)
     g = (arr[:,:,1] >> 2).astype(np.uint16)
@@ -67,7 +71,7 @@ def convert_image_to_rgb565(image_data: bytes, size: tuple) -> bytes:
     rgb565 = (r << 11) | (g << 5) | b
     return rgb565.tobytes()
 
-def encode_art(image_data: bytes, format: int, chunk_size: int = 512, size: tuple = (240,240)) -> list[bytes]:
+def encode_art(image_data: bytes, format: int, chunk_size: int = 2048, size: tuple = (240,240)) -> list[bytes]:
     # FORMAT NOT IMPLEMENTED YET!!!
     image_data_rgb565 = convert_image_to_rgb565(image_data, size)
 

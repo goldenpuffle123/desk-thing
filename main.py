@@ -1,135 +1,139 @@
 import asyncio
 import threading
 import time
-from packet_encoder import encode_art, encode_meta, ArtFormat
-
-from winrt.windows.media.control import \
-    GlobalSystemMediaTransportControlsSessionManager as SessionManager
-from winrt.windows.storage.streams import \
-    DataReader, Buffer, InputStreamOptions
-import matplotlib.pyplot as plt
-from PIL import Image
-import io
 import queue
 import serial
+import functools
+from winrt.windows.media.control import \
+    GlobalSystemMediaTransportControlsSessionManager as SessionManager
+from winrt.windows.storage.streams import DataReader
+from packet_encoder import encode_art, encode_meta, ArtFormat
 
-last_track = None
+# --- CONFIGURATION ---
+SERIAL_PORT = 'COM3'  
+BAUD_RATE = 921600    
+# ---------------------
+
 serial_tx_queue = queue.Queue()
+last_track_id = None
 
-def serial_tx(ser: serial.Serial):
+def serial_manager():
+    """Robust Serial Thread"""
     while True:
         try:
-            print("Serial connected")
+            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+            print(f"Connected to {SERIAL_PORT}")
+            with serial_tx_queue.mutex: 
+                serial_tx_queue.queue.clear()
+
             while True:
-                msg = serial_tx_queue.get()
-                print("Sending to serial:", msg)
-                ser.write((msg + "\n").encode())
+                # 1. TRANSMIT
+                while not serial_tx_queue.empty():
+                    msg = serial_tx_queue.get()
+                    ser.write(msg)
+                    
+                    # Throttle: Small pause for header, tiny pause for chunks
+                    if len(msg) < 50: 
+                        time.sleep(0.05) 
+                    else: 
+                        time.sleep(0.002)
+
+                # 2. RECEIVE
+                if ser.in_waiting:
+                    try:
+                        line = ser.readline().decode('utf-8', errors='ignore').strip()
+                        if line: 
+                            print(f"[ESP32] {line}")
+                    except: 
+                        pass
+                
+                time.sleep(0.001)
 
         except Exception as e:
-            print("Serial tx error:", e)
-            time.sleep(2)  # retry
+            print(f"Serial Error: {e}")
+            time.sleep(2)
+        finally:
+            try:
+                if 'ser' in locals() and ser.is_open: ser.close()
+            except: pass
 
-def serial_rx(ser: serial.Serial):
-    while True:
-        try:
-            ret = ser.readline().decode(errors="ignore").strip()
-            if ret:
-                print("[ESP32] ", ret)
-        except Exception as e:
-            print("Serial rx error:", e)
-            break
-
-def format_media_for_serial(info_dict):
-    return f"META|{info_dict['artist']}|{info_dict['title']}"
+async def get_artwork(thumbnail_ref):
+    if not thumbnail_ref: return None
+    try:
+        stream = await thumbnail_ref.open_read_async()
+        reader = DataReader(stream)
+        await reader.load_async(stream.size)
+        image_data = bytearray(stream.size)
+        reader.read_bytes(image_data)
+        return image_data
+    except:
+        return None
 
 async def handle_media_properties_changed(current_session):
-    """Callback handler for media playback changes"""
-    global last_track
-    global serial_tx_queue
+    global last_track_id
     try:
-        print("\nMedia change detected...")
-        info_dict, image_data = await get_media_info(current_session)
-        if info_dict:
-            if info_dict == last_track: # Prevent duplicates, weird behavior
-                return
-            serial_tx_queue.put(
-                encode_meta(info_dict['title'], info_dict['artist'], info_dict['album_title'])
-            )
-        if image_data:
-            art_packets = encode_art(
-                image_data, ArtFormat.RGB565
-            )
-            for packet in art_packets:
-                serial_tx_queue.put(packet)
-        display_media_info(info_dict, image_data) # for demo on this computer
-        last_track = info_dict
-    except Exception as e:
-        print(f"Error handling playback change: {e}")
-
-async def setup_handler():
-    loop = asyncio.get_running_loop()
-    sessions = await SessionManager.request_async()
-    current_session = sessions.get_current_session()
-    if current_session:
-        def handler(sender, args):
-            asyncio.run_coroutine_threadsafe(handle_media_properties_changed(current_session), loop)
-        playback_event_token = current_session.add_media_properties_changed(handler)
-        return playback_event_token, current_session
-    return None, None
-
-async def get_media_info(current_session):
-    if current_session:
+        # PHASE 1: FAST TEXT
         info = await current_session.try_get_media_properties_async()
+        track_id = f"{info.title}-{info.artist}"
         
-        info_dict = {
-            "album_artist": info.album_artist,
-            "album_title": info.album_title,
-            "album_track_count": info.album_track_count,
-            "artist": info.artist,
-            "genres": list(info.genres),
-            "subtitle": info.subtitle,
-            "title": info.title,
-            "track_number": info.track_number
-        }
-        
-        image_data = None
-        if info.thumbnail:
-            stream = await info.thumbnail.open_read_async()
-            reader = DataReader(stream)
-            await reader.load_async(stream.size)
-            image_data = bytearray(stream.size)
-            reader.read_bytes(image_data)
-        
-        return info_dict, image_data
-    return None, None
+        # Always print, but only send if changed
+        if track_id != last_track_id:
+            last_track_id = track_id
+            print(f"\nNow Playing: {info.title} - {info.artist}")
+            serial_tx_queue.put(encode_meta(info.title, info.artist, info.album_title))
 
-def display_media_info(info_dict, image_data):
-    print("Current Media Info:")
-    print(info_dict)
-    
-    if image_data:
-        print("Thumbnail received")
-        # image = Image.open(io.BytesIO(image_data))
-        # image = image.resize((200, 200))
-        # w, h = image.size
-        # fmt = image.format
-        # image.show()
+            # PHASE 2: SLOW ART
+            # Only fetch art if the track actually changed
+            if info.thumbnail:
+                image_data = await get_artwork(info.thumbnail)
+                if image_data:
+                    loop = asyncio.get_running_loop()
+                    art_packets = await loop.run_in_executor(
+                        None, 
+                        functools.partial(encode_art, image_data, ArtFormat.RGB565)
+                    )
+                    print(f"Sending Art ({len(art_packets)} chunks)...")
+                    for packet in art_packets:
+                        serial_tx_queue.put(packet)
+                        
+    except Exception as e:
+        print(f"Error: {e}")
 
 async def main():
-    ser = serial.Serial('COM3', 9600, timeout=0.1)
-    time.sleep(2)  # wait for serial to initialize
-    threading.Thread(target=serial_tx, args=(ser,), daemon=True).start()
-    threading.Thread(target=serial_rx, args=(ser,), daemon=True).start()
+    # Start Serial
+    threading.Thread(target=serial_manager, daemon=True).start()
 
-    token, session = await setup_handler()
-    if token:
-        print("Media event listener active. Press Ctrl+C to exit.")
-        try:
-            while True:
-                await asyncio.sleep(5)
-        except KeyboardInterrupt:
-            session.remove_media_properties_changed(token)
-            print("Exiting...")
+    # Start Media Session Manager
+    sessions = await SessionManager.request_async()
+    current_session = sessions.get_current_session()
+    
+    if current_session:
+        print(f"Attached to: {current_session.source_app_user_model_id}")
+        
+        # 1. Run once immediately
+        await handle_media_properties_changed(current_session)
+        
+        # 2. Setup Background Listener
+        # CRITICAL FIX: Capture the loop HERE, before defining the lambda
+        loop = asyncio.get_running_loop()
+        
+        def safe_handler(sender, args):
+            # Use the captured 'loop' variable to safely schedule the coroutine
+            asyncio.run_coroutine_threadsafe(
+                handle_media_properties_changed(current_session), 
+                loop
+            )
+
+        current_session.add_media_properties_changed(safe_handler)
+        
+        print("Listening... (Ctrl+C to stop)")
+        while True: 
+            await asyncio.sleep(1)
+    else:
+        print("No active media session found.")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
