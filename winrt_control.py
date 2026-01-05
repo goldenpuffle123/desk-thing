@@ -4,8 +4,11 @@ import time
 import queue
 import serial
 import functools
-from winrt.windows.media.control import \
-    GlobalSystemMediaTransportControlsSessionManager as SessionManager
+from winrt.windows.media.control import (
+    GlobalSystemMediaTransportControlsSessionManager as SessionManager,
+    GlobalSystemMediaTransportControlsSessionMediaProperties as MediaProperties
+)
+    
 from winrt.windows.media.control import \
     GlobalSystemMediaTransportControlsSession as Session
 from winrt.windows.storage.streams import DataReader
@@ -16,8 +19,7 @@ SERIAL_PORT = 'COM3'
 BAUD_RATE = 921600    
 # ---------------------
 
-serial_tx_queue = queue.Queue()
-last_track_id = None
+# serial_tx_queue = queue.Queue()
 
 # def serial_manager():
 #     """Robust Serial Thread"""
@@ -59,6 +61,118 @@ last_track_id = None
 #                 if 'ser' in locals() and ser.is_open: ser.close()
 #             except: pass
 
+class MediaController:
+    def __init__(self, loop):
+        self.loop = loop
+        self.session_manager: SessionManager = None
+        self.current_session: Session = None
+        self.session_token = None
+        self.media_token = None
+        self.last_track_id = None
+
+    async def setup(self, session_manager: SessionManager):
+        self.session_manager = session_manager
+        while(self.current_session is None):
+            print("Finding media session...")
+            self.current_session = self.session_manager.get_current_session()
+            await asyncio.sleep(1)
+        print(f"Found session: {self.current_session.source_app_user_model_id}")
+        self.session_token = self.session_manager.add_current_session_changed(
+            lambda sender, args: asyncio.run_coroutine_threadsafe(
+                self.handle_current_session_changed(), 
+                self.loop
+            )
+        )
+        self.media_token = self.current_session.add_media_properties_changed(
+            lambda sender, args: asyncio.run_coroutine_threadsafe(
+                self.handle_media_properties_changed(), 
+                self.loop
+            )
+        )
+
+    def metadata_ready(self, info: MediaProperties):
+        return bool(info.title or info.artist)
+
+    def track_changed(self, info):
+        curr = make_track_id(info)
+        if curr != self.last_track_id:
+            self.last_track_id = curr
+            return True
+        return False
+
+    async def handle_current_session_changed(self):
+        try:
+            if self.current_session and self.media_token:
+                self.current_session.remove_media_properties_changed(self.media_token)
+                self.media_token = None
+            self.current_session = self.session_manager.get_current_session()
+            self.last_track_id = None
+
+            if self.current_session:
+                print(f"\nCurrent session changed to: {self.current_session.source_app_user_model_id}")
+                self.media_token = self.current_session.add_media_properties_changed(
+                    lambda sender, args: asyncio.run_coroutine_threadsafe(
+                        self.handle_media_properties_changed(), 
+                        self.loop
+                    )
+                )
+                await self.handle_media_properties_changed()
+            else:
+                print("\nNo active media session.")
+        except Exception as e:
+            print(f"Error handling session change: {e}")
+
+    async def handle_media_properties_changed(self):
+        try:
+            # PHASE 1: FAST TEXT
+            if not self.current_session:
+                print("No current session.")
+                return
+            info = await self.current_session.try_get_media_properties_async()
+            if not self.metadata_ready(info):
+                print("Metadata not ready.")
+                return
+            # Always print, but only send if changed
+            if self.track_changed(info):
+                info_dict = {
+                    "album_artist": info.album_artist,
+                    "album_title": info.album_title,
+                    "album_track_count": info.album_track_count,
+                    "artist": info.artist,
+                    "genres": list(info.genres),
+                    "subtitle": info.subtitle,
+                    "title": info.title,
+                    "track_number": info.track_number
+                }
+                print("\nNow Playing: ")
+                print("Current session is "+self.current_session.source_app_user_model_id)
+                for key, value in info_dict.items():
+                    print(f"{key}: {value}")
+                # serial_tx_queue.put(encode_meta(info.title, info.artist, info.album_title))
+
+                # PHASE 2: SLOW ART
+                # Only fetch art if the track actually changed
+                if info.thumbnail:
+                    image_data = await get_artwork(info.thumbnail)
+                    if image_data:
+                        # loop = asyncio.get_running_loop()
+                        # art_packets = await loop.run_in_executor(
+                        #     None, 
+                        #     functools.partial(encode_art, image_data, ArtFormat.RGB565)
+                        # )
+                        # print(f"Sending Art ({len(art_packets)} chunks)...")
+                        # for packet in art_packets:
+                        #     serial_tx_queue.put(packet)
+                        print("Image received.")
+                            
+        except Exception as e:
+            print(f"Error: {e}")
+
+
+
+def make_track_id(info: MediaProperties):
+    return (info.title.strip(), info.artist.strip(), info.album_title.strip())
+
 async def get_artwork(thumbnail_ref):
     if not thumbnail_ref: return None
     try:
@@ -71,103 +185,20 @@ async def get_artwork(thumbnail_ref):
     except:
         return None
 
-async def handle_media_properties_changed(current_session: Session):
-    global last_track_id
-    try:
-        # PHASE 1: FAST TEXT
-        info = await current_session.try_get_media_properties_async()
-        track_id = f"{info.title}-{info.artist}"
-        
-        # Always print, but only send if changed
-        if track_id != last_track_id:
-            last_track_id = track_id
-            info_dict = {
-                "album_artist": info.album_artist,
-                "album_title": info.album_title,
-                "album_track_count": info.album_track_count,
-                "artist": info.artist,
-                "genres": list(info.genres),
-                "subtitle": info.subtitle,
-                "title": info.title,
-                "track_number": info.track_number
-            }
-            print("\nNow Playing: ")
-            print("Current session is "+current_session.source_app_user_model_id)
-            for key, value in info_dict.items():
-                print(f"{key}: {value}")
-            # serial_tx_queue.put(encode_meta(info.title, info.artist, info.album_title))
-
-            # PHASE 2: SLOW ART
-            # Only fetch art if the track actually changed
-            if info.thumbnail:
-                image_data = await get_artwork(info.thumbnail)
-                if image_data:
-                    # loop = asyncio.get_running_loop()
-                    # art_packets = await loop.run_in_executor(
-                    #     None, 
-                    #     functools.partial(encode_art, image_data, ArtFormat.RGB565)
-                    # )
-                    # print(f"Sending Art ({len(art_packets)} chunks)...")
-                    # for packet in art_packets:
-                    #     serial_tx_queue.put(packet)
-                    print("Image received.")
-                        
-    except Exception as e:
-        print(f"Error: {e}")
-
-async def handle_current_session_changed(sessions: SessionManager):
-    global last_track_id
-    try:
-        current_session = sessions.get_current_session()
-        if current_session:
-            print(f"\nCurrent session changed to: {current_session.source_app_user_model_id}")
-            last_track_id = None  # Reset last track to force update
-            await handle_media_properties_changed(current_session)
-        else:
-            print("\nNo active media session.")
-    except Exception as e:
-        print(f"Error handling session change: {e}")
 
 async def main():
     # Start Serial
     # threading.Thread(target=serial_manager, daemon=True).start()
 
     # Start Media Session Manager
-    sessions = await SessionManager.request_async()
-    current_session = sessions.get_current_session()
+    asyncio_loop = asyncio.get_running_loop()
+    media_controller = MediaController(asyncio_loop)
+    session_manager = await SessionManager.request_async()
+    await media_controller.setup(session_manager)
 
-    loop = asyncio.get_running_loop() # Capture the event loop here
-
-    def handler_current_session_changed(sender, args):
-        asyncio.run_coroutine_threadsafe(
-            handle_current_session_changed(sessions), 
-            loop
-        )
-
-    sessions.add_current_session_changed(handler_current_session_changed)
-    
-    while(current_session is None):
-        print("No active media session found.")
-        current_session = sessions.get_current_session()
-        await asyncio.sleep(1)
-
-    print(f"Attached to: {current_session.source_app_user_model_id}")
     
     # 1. Run once immediately
-    await handle_media_properties_changed(current_session)
-    
-    # 2. Setup Background Listener
-    # CRITICAL FIX: Capture the loop HERE, before defining the lambda
-    
-    
-    def handler_media_properties_changed(sender, args):
-        # Use the captured 'loop' variable to safely schedule the coroutine
-        asyncio.run_coroutine_threadsafe(
-            handle_media_properties_changed(current_session), 
-            loop
-        )
-
-    current_session.add_media_properties_changed(handler_media_properties_changed)
+    await media_controller.handle_media_properties_changed()
     
     print("Listening... (Ctrl+C to stop)")
     while True: 
