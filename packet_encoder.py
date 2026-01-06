@@ -6,6 +6,7 @@ import numpy as np
 SOF = 0x7E
 META = 0x01
 PLAYBACK_STATE = 0x02
+TIMELINE = 0x03
 ART_BEGIN = 0x10
 ART_CHUNK = 0x11
 ART_END = 0x12
@@ -63,6 +64,23 @@ class ArtFormat(IntEnum):
 
 def convert_image_to_rgb565(image_data: bytes, size: tuple) -> bytes:
     image = Image.open(io.BytesIO(image_data)).convert("RGB")
+    
+    # Crop to match target aspect ratio
+    target_aspect = size[0] / size[1]
+    current_aspect = image.width / image.height
+    
+    if current_aspect > target_aspect:
+        # Image is wider than target, crop width
+        new_width = int(image.height * target_aspect)
+        left = (image.width - new_width) // 2
+        image = image.crop((left, 0, left + new_width, image.height))
+    elif current_aspect < target_aspect:
+        # Image is taller than target, crop height
+        new_height = int(image.width / target_aspect)
+        top = (image.height - new_height) // 2
+        image = image.crop((0, top, image.width, top + new_height))
+    
+    # Now resize to exact target size
     image = image.resize(size)
     arr = np.asarray(image, dtype=np.uint8)
     r = (arr[:,:,0] >> 3).astype(np.uint16)
@@ -71,7 +89,7 @@ def convert_image_to_rgb565(image_data: bytes, size: tuple) -> bytes:
     rgb565 = (r << 11) | (g << 5) | b
     return rgb565.tobytes()
 
-def encode_art(image_data: bytes, format: int, chunk_size: int = 2048, size: tuple = (240,240)) -> list[bytes]:
+def encode_art(image_data: bytes, format: int, chunk_size: int = 2048, size: tuple = (240,200)) -> list[bytes]:
     # FORMAT NOT IMPLEMENTED YET!!!
     image_data_rgb565 = convert_image_to_rgb565(image_data, size)
 
@@ -107,3 +125,14 @@ def encode_art(image_data: bytes, format: int, chunk_size: int = 2048, size: tup
         encode(ART_END, b"")
     )
     return packets
+
+def encode_timeline(position_s: int, duration_s: int) -> bytes:
+    payload = bytearray()
+    pos = min(position_s, 65535)
+    dur = min(duration_s, 65535)
+    payload.extend(pos.to_bytes(2, 'little'))
+    payload.extend(dur.to_bytes(2, 'little'))
+    return encode(TIMELINE, bytes(payload))
+
+if __name__ == '__main__':
+    pass
