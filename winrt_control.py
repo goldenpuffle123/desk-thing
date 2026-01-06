@@ -112,16 +112,32 @@ class MediaController:
         if not self.timeline_task:
             self.timeline_task = self.loop.create_task(self._timeline_worker())
 
+    def _refresh_timeline_anchor(self):
+        """Snapshots the current Windows timeline state to our local anchor."""
+        try:
+            if not self.current_session: return
+
+            # 1. Get fresh properties from Windows
+            props = self.current_session.get_timeline_properties()
+            
+            if self.timeline_changed(props):
+                # 2. Update our local anchors
+                self.timeline_anchor = props
+                self.time_anchor = time.monotonic() # Reset the clock!
+                
+                # Debug
+                print(f"Anchor Reset: Pos={props.position.total_seconds():.1f}")
+        except Exception as e:
+            print(f"Refresh error: {e}")
+
     async def _timeline_worker(self):
         print("Timeline worker started.")
         while True:
             try:
                 if self.current_session and self.timeline_anchor and self.is_playing:
-                    now = time.monotonic()
 
-                    curr_playback = self.current_session.get_playback_info()
-                    if curr_playback.playback_status.name == 'PLAYING':
-                        elapsed = now - self.time_anchor
+                    if self.is_playing:
+                        elapsed = time.monotonic() - self.time_anchor
                         current_pos = self.timeline_anchor.position.total_seconds() + elapsed
                         total_dur = self.timeline_anchor.end_time.total_seconds()
                         # Clamp
@@ -140,14 +156,7 @@ class MediaController:
                 await asyncio.sleep(1)  # Wait before retrying on error
 
     def handle_timeline_changed(self, source=""): # Keep this for instant updates, use polling for regular
-        try:
-            if not self.current_session:
-                return
-            self.time_anchor = time.monotonic()
-            self.timeline_anchor = self.current_session.get_timeline_properties()
-            print(f"Timeline changed: Position={self.timeline_anchor.position}, Duration={self.timeline_anchor.end_time}, Source={source}")
-        except Exception as e:
-            print(f"Error handling timeline change: {e}")
+        self._refresh_timeline_anchor()
 
     def update_time(self): # For arduino
         pass
@@ -167,6 +176,14 @@ class MediaController:
             self.last_playback_status = status
             return True
         return False
+    
+    def timeline_changed(self, timeline):
+        if not self.timeline_anchor:
+            return True
+        if timeline.position != self.timeline_anchor.position:
+            return True
+        return False
+
 
     async def handle_current_session_changed(self):
         try:
@@ -177,9 +194,9 @@ class MediaController:
                 self.current_session.remove_playback_info_changed(self.playback_token)
                 self.playback_token = None
             if self.current_session and self.timeline_token:
-                print("asdf")
                 self.current_session.remove_timeline_properties_changed(self.timeline_token)
                 self.timeline_token = None
+                self.timeline_anchor = None
                 
             self.current_session = self.session_manager.get_current_session()
             self.last_track_id = None # Reset track ID on session change
@@ -218,25 +235,11 @@ class MediaController:
                 return
             # Always print, but only send if changed
             if self.track_changed(info):
-                self.handle_timeline_changed("media handler")   # Update timeline on track change
                 
-                info_dict = {
-                    "album_artist": info.album_artist,
-                    "album_title": info.album_title,
-                    "album_track_count": info.album_track_count,
-                    "artist": info.artist,
-                    "genres": list(info.genres),
-                    "subtitle": info.subtitle,
-                    "title": info.title,
-                    "track_number": info.track_number
-                }
-                print("\nNow Playing: ")
-                print("Current session is "+self.current_session.source_app_user_model_id)
-                for key, value in info_dict.items():
-                    print(f"{key}: {value}")
+                print(f"\nNow Playing: {info.title} - {info.artist}")
                 # serial_tx_queue.put(encode_meta(info.title, info.artist, info.album_title))
 
-                # self.handle_playback_info_changed()   #!!!!!!!!!!!!!!!!
+                self._refresh_timeline_anchor()
                 
                 # PHASE 2: SLOW ART
                 # Only fetch art if the track actually changed
@@ -264,7 +267,11 @@ class MediaController:
             if self.playback_status_changed(status):
                 self.is_playing = (status.name == 'PLAYING')
                 print(f"Playback status: {status.name}")
-                # self.handle_timeline_changed("playback handler")  # Update timeline on playback change
+                
+                # CRITICAL FIX: If we just started playing, reset the clock.
+                if self.is_playing:
+                    self._refresh_timeline_anchor()
+                    
         except Exception as e:
             print(f"Error handling playback info change: {e}")
 
