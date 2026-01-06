@@ -1,4 +1,5 @@
 import asyncio
+import math
 import threading
 import time
 import datetime
@@ -74,10 +75,12 @@ class MediaController:
         self.timeline_token = None
 
         self.timeline_task = None
-        self.last_time = None
+        self.time_anchor = 0
+        self.timeline_anchor = None
 
         self.last_track_id = None
         self.last_playback_status = None
+        self.is_playing = False
 
 
     async def setup(self, session_manager: SessionManager):
@@ -104,7 +107,7 @@ class MediaController:
         )
 
         self.timeline_token = self.current_session.add_timeline_properties_changed(
-            lambda sender, args: self.handle_timeline_changed()
+            lambda sender, args: self.handle_timeline_changed("timeline handler")
         )
         if not self.timeline_task:
             self.timeline_task = self.loop.create_task(self._timeline_worker())
@@ -113,37 +116,36 @@ class MediaController:
         print("Timeline worker started.")
         while True:
             try:
-                if not self.current_session:
-                    await asyncio.sleep(1)
-                    continue
-                try:
+                if self.current_session and self.timeline_anchor and self.is_playing:
+                    now = time.monotonic()
+
                     curr_playback = self.current_session.get_playback_info()
                     if curr_playback.playback_status.name == 'PLAYING':
-                        curr_time = time.time()
-                        shift = curr_time - (self.last_time or 1)
-                        timeline = self.current_session.get_timeline_properties()
-                        current_seconds = timeline.position
-                        total_seconds = timeline.end_time
-                        
+                        elapsed = now - self.time_anchor
+                        current_pos = self.timeline_anchor.position.total_seconds() + elapsed
+                        total_dur = self.timeline_anchor.end_time.total_seconds()
+                        # Clamp
+                        if current_pos > total_dur: current_pos = total_dur
+                        if current_pos < 0: current_pos = 0
                         # SEND TO SERIAL HERE
-                        print(f"Timeline: Position={current_seconds}, Duration={total_seconds}")
-                except Exception as e:
-                    # Session might be invalidated during poll
-                    pass
+                        print(f"Timeline: Position={current_pos}, Duration={total_dur}")
 
                 await asyncio.sleep(1) # Poll every 1 second
 
             except asyncio.CancelledError:
                 print("Timeline worker cancelled.")
                 break
+            except Exception as e:
+                print(f"Error in timeline worker: {e}")
+                await asyncio.sleep(1)  # Wait before retrying on error
 
-    def handle_timeline_changed(self): # Keep this for instant updates, use polling for regular
+    def handle_timeline_changed(self, source=""): # Keep this for instant updates, use polling for regular
         try:
             if not self.current_session:
                 return
-            timeline = self.current_session.get_timeline_properties()
-            self.last_time = time.time()
-            print(f"Timeline changed: Position={timeline.position}, Duration={timeline.end_time}")
+            self.time_anchor = time.monotonic()
+            self.timeline_anchor = self.current_session.get_timeline_properties()
+            print(f"Timeline changed: Position={self.timeline_anchor.position}, Duration={self.timeline_anchor.end_time}, Source={source}")
         except Exception as e:
             print(f"Error handling timeline change: {e}")
 
@@ -175,6 +177,7 @@ class MediaController:
                 self.current_session.remove_playback_info_changed(self.playback_token)
                 self.playback_token = None
             if self.current_session and self.timeline_token:
+                print("asdf")
                 self.current_session.remove_timeline_properties_changed(self.timeline_token)
                 self.timeline_token = None
                 
@@ -194,7 +197,7 @@ class MediaController:
                     lambda sender, args: self.handle_playback_info_changed()
                 )
                 self.timeline_token = self.current_session.add_timeline_properties_changed(
-                    lambda sender, args: self.handle_timeline_changed()
+                    lambda sender, args: self.handle_timeline_changed("timeline handler")
                 )
                 await self.handle_media_properties_changed()
                 
@@ -215,6 +218,7 @@ class MediaController:
                 return
             # Always print, but only send if changed
             if self.track_changed(info):
+                self.handle_timeline_changed("media handler")   # Update timeline on track change
                 
                 info_dict = {
                     "album_artist": info.album_artist,
@@ -255,10 +259,12 @@ class MediaController:
     def handle_playback_info_changed(self):
         try:
             if not self.current_session:
-                return
-            curr_playback_status = self.current_session.get_playback_info().playback_status
-            if self.playback_status_changed(curr_playback_status):
-                print(f"Playback status changed: {curr_playback_status.name}")
+                return  
+            status = self.current_session.get_playback_info().playback_status
+            if self.playback_status_changed(status):
+                self.is_playing = (status.name == 'PLAYING')
+                print(f"Playback status: {status.name}")
+                # self.handle_timeline_changed("playback handler")  # Update timeline on playback change
         except Exception as e:
             print(f"Error handling playback info change: {e}")
 
