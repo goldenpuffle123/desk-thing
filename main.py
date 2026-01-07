@@ -80,6 +80,7 @@ class MediaController:
 
         self.last_track_id = None
         self.last_playback_status = None
+        self.last_album_title = None
         self.is_playing = False
 
 
@@ -249,9 +250,6 @@ class MediaController:
                 return
             # Always print, but only send if changed
 
-            # To do: funky logic
-            old_album = info.album_title
-
             if self.track_changed(info):
                 
                 print(f"\nNow Playing: {info.title} - {info.artist}")
@@ -261,30 +259,35 @@ class MediaController:
                 
                 # PHASE 2: SLOW ART
                 # Only fetch art if thumbnail exists and album actually changed
-                if info.thumbnail: # and info.album_title != old_album
-                    if not old_album or old_album != info.album_title:
-                        print(f"DEBUG: Thumbnail exists, fetching artwork...")
-                        image_data = await get_artwork(info.thumbnail)
-                        if image_data:
-                            print(f"DEBUG: Image data received ({len(image_data)} bytes)")
-                            try:
-                                loop = asyncio.get_running_loop()
-                                art_packets = await loop.run_in_executor(
-                                    None, 
-                                    functools.partial(encode_art, image_data, ArtFormat.RGB565)
-                                )
-                                print(f"Sending Art ({len(art_packets)} chunks)...")
-                                for packet in art_packets:
-                                    serial_tx_queue.put(packet)
-                                print("Art sent to queue.")
-                            except Exception as art_err:
-                                print(f"ERROR encoding art: {art_err}")
-                        else:
-                            print(f"DEBUG: Failed to get image data from thumbnail")
+                print(f"Curr: {info.album_title} Last: {self.last_album_title}")
+                print((not info.album_title or info.album_title != self.last_album_title))
+                album_changed = (not info.album_title or info.album_title != self.last_album_title)
+                if info.thumbnail and album_changed:
+                    print(f"DEBUG: Thumbnail exists, fetching artwork...")
+                    image_data = await get_artwork(info.thumbnail)
+                    if image_data:
+                        print(f"DEBUG: Image data received ({len(image_data)} bytes)")
+                        try:
+                            loop = asyncio.get_running_loop()
+                            art_packets = await loop.run_in_executor(
+                                None, 
+                                functools.partial(encode_art, image_data, ArtFormat.RGB565)
+                            )
+                            print(f"Sending Art ({len(art_packets)} chunks)...")
+                            for packet in art_packets:
+                                serial_tx_queue.put(packet)
+                            print("Art sent to queue.")
+                        except Exception as art_err:
+                            print(f"ERROR encoding art: {art_err}")
                     else:
-                        print(f"DEBUG: Album unchanged, skipping artwork fetch")
+                        print(f"DEBUG: Failed to get image data from thumbnail")
+                elif not album_changed:
+                    print(f"DEBUG: Album unchanged, skipping artwork fetch")
                 else:
                     print(f"DEBUG: No thumbnail available")
+                
+                # Update album tracker
+                self.last_album_title = info.album_title
                             
         except Exception as e:
             print(f"Error: {e}")
