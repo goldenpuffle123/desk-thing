@@ -14,7 +14,7 @@ from winrt.windows.media.control import (
 from winrt.windows.media.control import \
     GlobalSystemMediaTransportControlsSession as Session
 from winrt.windows.storage.streams import DataReader
-from packet_encoder import encode_art, encode_meta, encode_timeline, ArtFormat
+from packet_encoder import encode_art, encode_meta, encode_timeline, encode_playback, ArtFormat
 
 # --- CONFIGURATION ---
 SERIAL_PORT = 'COM3'
@@ -232,6 +232,7 @@ class MediaController:
                     lambda sender, args: self.handle_timeline_changed("timeline handler")
                 )
                 await self.handle_media_properties_changed()
+                self.handle_playback_info_changed() # Fire
                 
             else:
                 print("\nNo active media session.")
@@ -259,8 +260,6 @@ class MediaController:
                 
                 # PHASE 2: SLOW ART
                 # Only fetch art if thumbnail exists and album actually changed
-                print(f"Curr: {info.album_title} Last: {self.last_album_title}")
-                print((not info.album_title or info.album_title != self.last_album_title))
                 album_changed = (not info.album_title or info.album_title != self.last_album_title)
                 if info.thumbnail and album_changed:
                     print(f"DEBUG: Thumbnail exists, fetching artwork...")
@@ -288,6 +287,7 @@ class MediaController:
                 
                 # Update album tracker
                 self.last_album_title = info.album_title
+            print(f"DEBUG: meta: {info.title} thumbnail_avail: {info.thumbnail is not None}")  # Error evident from here, to fix
                             
         except Exception as e:
             print(f"Error: {e}")
@@ -299,7 +299,9 @@ class MediaController:
             status = self.current_session.get_playback_info().playback_status
             if self.playback_status_changed(status):
                 self.is_playing = (status.name == 'PLAYING')
+                
                 print(f"Playback status: {status.name}")
+                serial_tx_queue.put(encode_playback(status.value))
                 
                 # CRITICAL FIX: If we just started playing, reset the clock.
                 if self.is_playing:

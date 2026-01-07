@@ -134,5 +134,18 @@ def encode_timeline(position_s: int, duration_s: int) -> bytes:
     payload.extend(dur.to_bytes(2, 'little'))
     return encode(TIMELINE, bytes(payload))
 
+# From winrt:
+# Closed 	0
+# Opened 	1
+# Changing 	2
+# Stopped 	3
+# Playing 	4
+# Paused 	5
+
+def encode_playback(state: int) -> bytes:
+    payload = bytearray()
+    payload.append(state & 0xFF) # 1 byte
+    return encode(PLAYBACK_STATE, bytes(payload))
+
 if __name__ == '__main__':
     pass

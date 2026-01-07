@@ -11,6 +11,8 @@
 
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 
+#define ST77XX_GRAY 0xB5B6
+
 // --- FUNCTION PROTOTYPES (Fixes "Not Declared" errors) ---
 void parseByte(uint8_t b);
 void handleMessage(uint8_t type, uint8_t* data, uint16_t len);
@@ -31,6 +33,9 @@ struct ArtState {
   bool active = false;
 };
 ArtState art;
+
+uint16_t timeline_width = 0;
+bool is_playing = true;
 
 enum ParseState { WAIT_SOF, READ_TYPE, READ_LEN_1, READ_LEN_2, READ_PAYLOAD, READ_CRC };
 ParseState state = WAIT_SOF;
@@ -122,6 +127,7 @@ void parseByte(uint8_t b) {
 void handleMessage(uint8_t type, uint8_t* data, uint16_t len) {
   switch (type) {
     case 0x01: handleMeta(data, len); break;
+    case 0x02: handlePlayback(data, len); break;
     case 0x03: handleTimeline(data, len); break;
     case 0x10: handleArtBegin(data, len); break;
     case 0x11: handleArtChunk(data, len); break; 
@@ -144,26 +150,41 @@ void handleMeta(uint8_t* data, uint16_t len) {
   tft.print(album);
 }
 
+void handlePlayback(uint8_t* data, uint16_t len) {
+  if (len!=1) return;
+  uint8_t playback_state = data[0];
+  is_playing = (playback_state == 4);
+  Serial.print("PLAYBACK: "); Serial.println(playback_state);
+  drawTimeline();
+}
+
 void handleTimeline(uint8_t* data, uint16_t len) {
   uint16_t idx = 0;
   if (len!=4) return;
   uint16_t pos; memcpy(&pos, data, 2);
   uint16_t dur; memcpy(&dur, data+2, 2);
-  uint16_t frac = (int)(pos/dur);
-
   if(dur==0) return;
+
+  
 
   uint16_t width = ((uint32_t)pos * 240) / dur;
 
   // 5. Clamp width just in case
   if (width > 240) width = 240;
 
+  timeline_width = width;
+
+  drawTimeline();
+  
+}
+
+void drawTimeline(){
   // 6. Draw the Bar (Red part)
-  tft.fillRect(0, 200, width, 5, ST77XX_RED); // Moved to y=220 to not overlap text
+  tft.fillRect(0, 200, timeline_width, 5, is_playing ? ST77XX_RED : ST77XX_GRAY); // Moved to y=220 to not overlap text
 
   // 7. Clear the Rest (Black part) -> "Erases" the bar when seeking back
-  if (width < 240) {
-    tft.fillRect(width, 200, 240 - width, 5, ST77XX_BLACK);
+  if (timeline_width < 240) {
+    tft.fillRect(timeline_width, 200, 240 - timeline_width, 5, ST77XX_BLACK);
   }
 }
 
