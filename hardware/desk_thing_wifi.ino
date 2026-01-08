@@ -7,27 +7,28 @@
 // --- HARDWARE CONFIG ---
 #define TFT_CS    10
 #define TFT_DC    9
-#define TFT_RST   6
-// #define TFT_BLK   2  // <--- UNCOMMENT IF YOU HAVE A BACKLIGHT PIN
-// -----------------------
+#define TFT_RST   7
+#define TFT_BL    6
 
+// --- DEEP SLEEP CONFIG ---
+hw_timer_t* timer = NULL;
+#define TOUCH_PIN_THRESHOLD 200
+volatile bool sleep_requested = false;
+#define SLEEP_TIME_MS 120000 // 2 min
+
+
+
+// --- GFX CONFIG ---
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
-
 #define ST77XX_GRAY 0xB5B6
 
+// --- WIFI CONFIG ---
 const char* SSID = SECRET_SSID;
 const char* PASS = SECRET_PASSWORD;
 WiFiServer server(7777);
 WiFiClient client;
 
-// --- FUNCTION PROTOTYPES (Fixes "Not Declared" errors) ---
-void parseByte(uint8_t b);
-void handleMessage(uint8_t type, uint8_t* data, uint16_t len);
-void handleMeta(uint8_t* data, uint16_t len);
-void handleArtBegin(uint8_t* data, uint16_t len);
-void handleArtChunk(uint8_t* data, uint16_t len);
-void handleArtEnd();
-
+// --- STATE VARIABLES ---
 enum ArtFormat : uint8_t { ART_FMT_JPEG = 0, ART_FMT_PNG = 1, ART_FMT_RGB565 = 2 };
 
 struct ArtState {
@@ -49,24 +50,53 @@ ParseState state = WAIT_SOF;
 uint8_t msgType, crc;
 uint16_t msgLen, bytesRead;
 
-// Increased payload buffer for safety (fits 4096 chunks + header)
-uint8_t payload[4096]; 
+uint8_t payload[4096];
+
+void ARDUINO_ISR_ATTR onTimer() {
+  sleep_requested = true;
+}
+
+void enterDeepSleep() {
+  Serial.println("Entering deep sleep...");
+  // Disable timer
+  timerDetachInterrupt(timer);
+  timerEnd(timer);
+  // Shutdown network
+  if (client.connected()) client.stop();
+  server.end();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  
+  digitalWrite(TFT_BL, LOW);
+  pinMode(TFT_CS, INPUT);
+  pinMode(TFT_DC, INPUT);
+  pinMode(TFT_RST, INPUT);
+  
+  delay(100);
+
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  touchSleepWakeUpEnable(T3, TOUCH_PIN_THRESHOLD); // GPIO 3 (for ESP32S3)
+
+  Serial.flush();
+  esp_deep_sleep_start();
+}
 
 void setup() {
   Serial.begin(115200);
-  
-  
-  
-  // 2. Display Init (240x240)
+  sleep_requested = false;
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
   tft.init(240, 280); 
   tft.setRotation(2);
-  
-  // 3. Critical: High Speed SPI (80MHz)
-  // This makes drawing 4x faster than default
   tft.setSPISpeed(80000000); 
-      
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(2);
+
+  // Config and start timer
+  timer = timerBegin(1000); // millisecond tick
+  timerAttachInterrupt(timer, &onTimer);
+  timerAlarm(timer, SLEEP_TIME_MS, false, 0);
   
   if (psramFound()) {
     Serial.printf("PSRAM Free: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -77,12 +107,11 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASS);
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+    if(sleep_requested) enterDeepSleep(); // Allow deep sleep if wifi not found
   }
-
   Serial.println("\nWIFI SETUP COMPLETE");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
@@ -90,6 +119,8 @@ void setup() {
   tft.println(WiFi.localIP());
 
   server.begin();
+
+  
 }
 
 void loop() {
@@ -98,11 +129,12 @@ void loop() {
     if (client) {
       Serial.println("CLIENT CONNECTED!"); 
       tft.println("CLIENT CONNECTED!");
-      delay(1000);
       tft.fillScreen(ST77XX_BLACK);
     }
     return;
   }
+
+  if(sleep_requested) enterDeepSleep();
 
   while (client.available()) {
     uint8_t byte = client.read();
@@ -114,6 +146,7 @@ void loop() {
 void parseByte(uint8_t b) {
   switch (state) {
     case WAIT_SOF:
+      timerRestart(timer); // Reset once per packet
       if (b == 0x7E) { crc = b; state = READ_TYPE; }
       break;
     case READ_TYPE:
