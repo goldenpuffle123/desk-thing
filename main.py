@@ -13,18 +13,17 @@ from winrt.windows.media.control import (
     
 from winrt.windows.media.control import \
     GlobalSystemMediaTransportControlsSession as Session
-from winrt.windows.storage.streams import DataReader
+from winrt.windows.storage.streams import DataReader, IRandomAccessStreamReference
 from packet_encoder import encode_art, encode_meta, encode_timeline, encode_playback, ArtFormat
 
-# --- CONFIGURATION ---
-SERIAL_PORT = 'COM3'
-BAUD_RATE = 921600    
-# ---------------------
+# CONFIGURATION
+SERIAL_PORT = 'COM3' # Fix hardcoding in the future
+BAUD_RATE = 921600
 
-serial_tx_queue = queue.Queue()
+serial_tx_queue = queue.Queue() # Global queue
 
 def serial_manager():
-    """Robust Serial Thread"""
+    """Robust serial thread for transmitting and receiving data."""
     while True:
         try:
             ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
@@ -40,9 +39,9 @@ def serial_manager():
                     
                     # Throttle: Small pause for header, tiny pause for chunks
                     if len(msg) < 50: 
-                        time.sleep(0.05) 
+                        time.sleep(0.05)
                     else: 
-                        time.sleep(0.002)
+                        time.sleep(0.001)
 
                 # 2. RECEIVE
                 if ser.in_waiting:
@@ -78,9 +77,12 @@ class MediaController:
         self.time_anchor = 0
         self.timeline_anchor = None
 
-        self.last_track_id = None
-        self.last_playback_status = None
+        self.current_track_id = None
         self.last_album_title = None
+        self.album_art_sent = False
+        self.artwork_in_flight = False
+
+        self.last_playback_status = None
         self.is_playing = False
 
 
@@ -89,7 +91,7 @@ class MediaController:
         while(self.current_session is None):
             print("Finding media session...")
             self.current_session = self.session_manager.get_current_session()
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
         print(f"Found session: {self.current_session.source_app_user_model_id}")
         self.session_token = self.session_manager.add_current_session_changed(
             lambda sender, args: asyncio.run_coroutine_threadsafe(
@@ -108,7 +110,7 @@ class MediaController:
         )
 
         self.timeline_token = self.current_session.add_timeline_properties_changed(
-            lambda sender, args: self.handle_timeline_changed("timeline handler")
+            lambda sender, args: self.handle_timeline_changed()
         )
         if not self.timeline_task:
             self.timeline_task = self.loop.create_task(self._timeline_worker())
@@ -118,11 +120,11 @@ class MediaController:
         try:
             if not self.current_session: return
 
-            # 1. Get fresh properties from Windows
+            # Get fresh properties from Windows
             props = self.current_session.get_timeline_properties()
             
             if self.timeline_changed(props):
-                # 2. Update our local anchors
+                # Update our local anchors
                 self.timeline_anchor = props
                 self.time_anchor = time.monotonic() # Reset the clock!
                 
@@ -132,12 +134,12 @@ class MediaController:
                         int(self.timeline_anchor.end_time.total_seconds())
                     )
                 )
-                # Debug
-                # print(f"Anchor Reset: Pos={props.position.total_seconds():.1f}")
         except Exception as e:
             print(f"Refresh error: {e}")
 
     async def _timeline_worker(self):
+        """Background task to periodically update timeline position."""
+
         print("Timeline worker started.")
         while True:
             try:
@@ -152,7 +154,7 @@ class MediaController:
                             current_pos = total_dur
                         if current_pos < 0:
                             current_pos = 0
-                        # SEND TO SERIAL HERE
+                        # Send time to serial
                         serial_tx_queue.put(
                             encode_timeline(
                                 int(current_pos),
@@ -170,34 +172,21 @@ class MediaController:
                 print(f"Error in timeline worker: {e}")
                 await asyncio.sleep(1)  # Wait before retrying on error
 
-    def handle_timeline_changed(self, source=""): # Keep this for instant updates, use polling for regular
+    def handle_timeline_changed(self):
+        """Handles timeline property changes from Windows. Used for instant updates (seeking/skip/etc.)."""
         self._refresh_timeline_anchor()
 
-    def update_time(self): # For arduino
-        pass
-
     def metadata_ready(self, info: MediaProperties):
+        """Check if metadata is ready (title or artist present)."""
         return bool(info.title or info.artist)
-
-    def track_changed(self, info):
-        curr = make_track_id(info)
-        if curr != self.last_track_id:
-            self.last_track_id = curr
-            return True
-        return False
     
     def playback_status_changed(self, status):
         if status != self.last_playback_status:
-            self.last_playback_status = status
             return True
         return False
     
     def timeline_changed(self, timeline):
-        if not self.timeline_anchor:
-            return True
-        if timeline.position != self.timeline_anchor.position:
-            return True
-        return False
+        return (not self.timeline_anchor or timeline.position != self.timeline_anchor.position)
 
 
     async def handle_current_session_changed(self):
@@ -213,8 +202,8 @@ class MediaController:
                 self.timeline_token = None
                 self.timeline_anchor = None
                 
-            self.current_session = self.session_manager.get_current_session()
-            self.last_track_id = None # Reset track ID on session change
+            self.current_session = self.session_manager.get_current_session() # Get new session
+            self.current_track_id = None # Reset track ID on session change
             self.last_playback_status = None # Reset playback status on session change
 
             if self.current_session:
@@ -229,11 +218,11 @@ class MediaController:
                     lambda sender, args: self.handle_playback_info_changed()
                 )
                 self.timeline_token = self.current_session.add_timeline_properties_changed(
-                    lambda sender, args: self.handle_timeline_changed("timeline handler")
+                    lambda sender, args: self.handle_timeline_changed()
                 )
                 await self.handle_media_properties_changed()
-                self.handle_playback_info_changed() # Fire
-                
+                self.handle_playback_info_changed() # Fire once to sync status
+                self.handle_timeline_changed() # Fire once to sync timeline
             else:
                 print("\nNo active media session.")
         except Exception as e:
@@ -241,56 +230,56 @@ class MediaController:
 
     async def handle_media_properties_changed(self):
         try:
-            # PHASE 1: FAST TEXT
             if not self.current_session:
                 print("No current session.")
                 return
             info = await self.current_session.try_get_media_properties_async()
             if not self.metadata_ready(info):
-                print("Metadata not ready.")
                 return
-            # Always print, but only send if changed
+            
+            track_id = make_track_id(info)
+            album_id = track_id[2]
 
-            if self.track_changed(info):
-                
+            # Any metadata change
+            if track_id != self.current_track_id:
+                self.current_track_id = track_id
                 print(f"\nNow Playing: {info.title} - {info.artist}")
-                serial_tx_queue.put(encode_meta(info.title, info.artist, info.album_title))
-
+                serial_tx_queue.put(
+                    encode_meta(info.title, info.artist, info.album_title)
+                )
                 self._refresh_timeline_anchor()
-                
-                # PHASE 2: SLOW ART
-                # Only fetch art if thumbnail exists and album actually changed
-                album_changed = (not info.album_title or info.album_title != self.last_album_title)
-                if info.thumbnail and album_changed:
-                    print(f"DEBUG: Thumbnail exists, fetching artwork...")
+            
+            # Album change
+            album_changed = (not album_id or album_id != self.last_album_title)
+            if album_changed:
+                self.album_art_sent = False
+                self.last_album_title = album_id
+            
+            # Send album art only once, if available
+            if info.thumbnail and not self.album_art_sent and not self.artwork_in_flight:
+                self.artwork_in_flight = True # Processing flag (get_artwork and encode_art take some time)
+                try:
                     image_data = await get_artwork(info.thumbnail)
                     if image_data:
-                        print(f"DEBUG: Image data received ({len(image_data)} bytes)")
+                        print(f"Image data received.")
                         try:
-                            loop = asyncio.get_running_loop()
-                            art_packets = await loop.run_in_executor(
+                            art_packets = await self.loop.run_in_executor(
                                 None, 
                                 functools.partial(encode_art, image_data, ArtFormat.RGB565)
                             )
-                            print(f"Sending Art ({len(art_packets)} chunks)...")
+                            print(f"Sending art...")
                             for packet in art_packets:
                                 serial_tx_queue.put(packet)
                             print("Art sent to queue.")
+                            self.album_art_sent = True # Mark as sent for current song/album
                         except Exception as art_err:
-                            print(f"ERROR encoding art: {art_err}")
+                            print(f"Error encoding art: {art_err}")
                     else:
-                        print(f"DEBUG: Failed to get image data from thumbnail")
-                elif not album_changed:
-                    print(f"DEBUG: Album unchanged, skipping artwork fetch")
-                else:
-                    print(f"DEBUG: No thumbnail available")
-                
-                # Update album tracker
-                self.last_album_title = info.album_title
-            print(f"DEBUG: meta: {info.title} thumbnail_avail: {info.thumbnail is not None}")  # Error evident from here, to fix
-                            
+                        print(f"Failed to get image data from thumbnail")
+                finally:
+                    self.artwork_in_flight = False # Clear processing flag
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error handling media properties change: {e}")
 
     def handle_playback_info_changed(self):
         try:
@@ -298,12 +287,12 @@ class MediaController:
                 return
             status = self.current_session.get_playback_info().playback_status
             if self.playback_status_changed(status):
+                self.last_playback_status = status
                 self.is_playing = (status.name == 'PLAYING')
-                
                 print(f"Playback status: {status.name}")
-                serial_tx_queue.put(encode_playback(status.value))
+                serial_tx_queue.put(encode_playback(status.value)) # Send update (other device decides what to do)
                 
-                # CRITICAL FIX: If we just started playing, reset the clock.
+                # Reset the clock if playback just started.
                 if self.is_playing:
                     self._refresh_timeline_anchor()
                     
@@ -315,12 +304,10 @@ class MediaController:
 
 
 def make_track_id(info: MediaProperties):
-    t = info.title
-    a = info.artist
-    al = info.album_title
-    return (t, a, al)
+    """Makes unique track identifier."""
+    return (info.title or "", info.artist or "", info.album_title or "")
 
-async def get_artwork(thumbnail_ref):
+async def get_artwork(thumbnail_ref: IRandomAccessStreamReference):
     if not thumbnail_ref: return None
     try:
         stream = await thumbnail_ref.open_read_async()
@@ -343,8 +330,7 @@ async def main():
     session_manager = await SessionManager.request_async()
     await media_controller.setup(session_manager)
 
-    
-    # 1. Run once immediately
+    # Run once immediately
     await media_controller.handle_media_properties_changed()
     
     print("Listening... (Ctrl+C to stop)")
