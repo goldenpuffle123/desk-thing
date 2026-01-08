@@ -89,7 +89,7 @@ def convert_image_to_rgb565(image_data: bytes, size: tuple) -> bytes:
     rgb565 = (r << 11) | (g << 5) | b
     return rgb565.tobytes()
 
-def encode_art(image_data: bytes, format: int, chunk_size: int = 2048, size: tuple = (240,200)) -> list[bytes]:
+def encode_art(image_data: bytes, format: int, chunk_size: int = 3072, size: tuple = (240,200)) -> list[bytes]:
     # FORMAT NOT IMPLEMENTED YET!!!
     image_data_rgb565 = convert_image_to_rgb565(image_data, size)
 
@@ -128,10 +128,10 @@ def encode_art(image_data: bytes, format: int, chunk_size: int = 2048, size: tup
 
 def encode_timeline(position_s: int, duration_s: int) -> bytes:
     payload = bytearray()
-    pos = min(position_s, 65535)
-    dur = min(duration_s, 65535)
-    payload.extend(pos.to_bytes(2, 'little'))
-    payload.extend(dur.to_bytes(2, 'little'))
+    pos = min(position_s, 4294967295) # 4 bytes max
+    dur = min(duration_s, 4294967295) # 4 bytes max
+    payload.extend(pos.to_bytes(4, 'little'))
+    payload.extend(dur.to_bytes(4, 'little'))
     return encode(TIMELINE, bytes(payload))
 
 # From winrt:

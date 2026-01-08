@@ -1,10 +1,10 @@
+from dotenv import load_dotenv
+import os
+import socket
 import asyncio
-import math
 import threading
 import time
-import datetime
 import queue
-import serial
 import functools
 from winrt.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionManager as SessionManager,
@@ -16,50 +16,62 @@ from winrt.windows.media.control import \
 from winrt.windows.storage.streams import DataReader, IRandomAccessStreamReference
 from packet_encoder import encode_art, encode_meta, encode_timeline, encode_playback, ArtFormat
 
-# CONFIGURATION
-SERIAL_PORT = 'COM3' # Fix hardcoding in the future
-BAUD_RATE = 921600
+socket_tx_queue = queue.Queue() # Global queue
 
-serial_tx_queue = queue.Queue() # Global queue
+load_dotenv()
+ESP32_IP = os.getenv("ESP32_IP")
+ESP32_PORT = int(os.getenv("ESP32_PORT"))
 
-def serial_manager():
+class WifiTransport:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.sock = None
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((self.host, self.port))
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def write(self, data: bytes):
+        self.sock.sendall(data)
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+
+def socket_manager():
     """Robust serial thread for transmitting and receiving data."""
     while True:
         try:
-            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-            print(f"Connected to {SERIAL_PORT}")
-            with serial_tx_queue.mutex: 
-                serial_tx_queue.queue.clear()
+            transport = WifiTransport(ESP32_IP, ESP32_PORT)
+            transport.connect()
+            print(f"Connected to {ESP32_IP}:{ESP32_PORT}")
 
             while True:
-                # 1. TRANSMIT
-                while not serial_tx_queue.empty():
-                    msg = serial_tx_queue.get()
-                    ser.write(msg)
-                    
-                    # Throttle: Small pause for header, tiny pause for chunks
-                    if len(msg) < 50: 
-                        time.sleep(0.05)
-                    else: 
-                        time.sleep(0.001)
-
-                # 2. RECEIVE
-                if ser.in_waiting:
+                while not socket_tx_queue.empty():
                     try:
-                        line = ser.readline().decode('utf-8', errors='ignore').strip()
-                        if line: 
-                            print(f"[ESP32] {line}")
-                    except: 
-                        pass
+                        packet = socket_tx_queue.get()
+                        transport.write(packet)
+                        
+                        # Throttle: Small pause for header, tiny pause for chunks
+                        if len(packet) < 50:
+                            time.sleep(0.01)
+                        else: 
+                            time.sleep(0.001)
+                    except (BrokenPipeError, ConnectionResetError):
+                        transport.close()
+                        time.sleep(1)
+                        transport.connect()
                 
                 time.sleep(0.001)
 
         except Exception as e:
-            print(f"Serial Error: {e}")
+            print(f"Socket Error: {e}")
             time.sleep(2)
         finally:
             try:
-                if 'ser' in locals() and ser.is_open: ser.close()
+                if 'transport' in locals(): transport.close()
             except: pass
 
 class MediaController:
@@ -128,7 +140,7 @@ class MediaController:
                 self.timeline_anchor = props
                 self.time_anchor = time.monotonic() # Reset the clock!
                 
-                serial_tx_queue.put(
+                socket_tx_queue.put(
                     encode_timeline(
                         int(self.timeline_anchor.position.total_seconds()), 
                         int(self.timeline_anchor.end_time.total_seconds())
@@ -154,8 +166,8 @@ class MediaController:
                             current_pos = total_dur
                         if current_pos < 0:
                             current_pos = 0
-                        # Send time to serial
-                        serial_tx_queue.put(
+                        # Send time to socket
+                        socket_tx_queue.put(
                             encode_timeline(
                                 int(current_pos),
                                 int(total_dur)
@@ -244,7 +256,7 @@ class MediaController:
             if track_id != self.current_track_id:
                 self.current_track_id = track_id
                 print(f"\nNow Playing: {info.title} - {info.artist}")
-                serial_tx_queue.put(
+                socket_tx_queue.put(
                     encode_meta(info.title, info.artist, info.album_title)
                 )
                 self._refresh_timeline_anchor()
@@ -269,7 +281,7 @@ class MediaController:
                             )
                             print(f"Sending art...")
                             for packet in art_packets:
-                                serial_tx_queue.put(packet)
+                                socket_tx_queue.put(packet)
                             print("Art sent to queue.")
                             self.album_art_sent = True # Mark as sent for current song/album
                         except Exception as art_err:
@@ -290,7 +302,7 @@ class MediaController:
                 self.last_playback_status = status
                 self.is_playing = (status.name == 'PLAYING')
                 print(f"Playback status: {status.name}")
-                serial_tx_queue.put(encode_playback(status.value)) # Send update (other device decides what to do)
+                socket_tx_queue.put(encode_playback(status.value)) # Send update (other device decides what to do)
                 
                 # Reset the clock if playback just started.
                 if self.is_playing:
@@ -322,7 +334,7 @@ async def get_artwork(thumbnail_ref: IRandomAccessStreamReference):
 
 async def main():
     # Start Serial
-    threading.Thread(target=serial_manager, daemon=True).start()
+    threading.Thread(target=socket_manager, daemon=True).start()
 
     # Start Media Session Manager
     asyncio_loop = asyncio.get_running_loop()
