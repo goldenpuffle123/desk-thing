@@ -1,6 +1,8 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <WiFi.h>
+#include <wifi_config.h>
 
 // --- HARDWARE CONFIG ---
 #define TFT_CS    10
@@ -12,6 +14,11 @@
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 
 #define ST77XX_GRAY 0xB5B6
+
+const char* SSID = SECRET_SSID;
+const char* PASS = SECRET_PASSWORD;
+WiFiServer server(7777);
+WiFiClient client;
 
 // --- FUNCTION PROTOTYPES (Fixes "Not Declared" errors) ---
 void parseByte(uint8_t b);
@@ -43,17 +50,12 @@ uint8_t msgType, crc;
 uint16_t msgLen, bytesRead;
 
 // Increased payload buffer for safety (fits 4096 chunks + header)
-uint8_t payload[8192]; 
+uint8_t payload[4096]; 
 
 void setup() {
-  // 1. Critical: Large Serial Buffer
-  Serial.setRxBufferSize(32768); 
-  Serial.begin(921600);
+  Serial.begin(115200);
   
-  #ifdef TFT_BLK
-    pinMode(TFT_BLK, OUTPUT);
-    digitalWrite(TFT_BLK, HIGH); 
-  #endif
+  
   
   // 2. Display Init (240x240)
   tft.init(240, 280); 
@@ -71,19 +73,41 @@ void setup() {
   } else {
     Serial.println("ERR: No PSRAM");
   }
-  Serial.println("SETUP COMPLETE");
+  Serial.println("HARDWARE SETUP COMPLETE");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SSID, PASS);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWIFI SETUP COMPLETE");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  tft.print("IP: ");
+  tft.println(WiFi.localIP());
+
+  server.begin();
 }
 
 void loop() {
-  // 4. Critical: Block Reading
-  // Reads chunks of data at once instead of 1 byte at a time
-  if (Serial.available()) {
-    uint8_t temp[512]; 
-    int count = Serial.readBytes(temp, min((int)Serial.available(), 512));
-    
-    for (int i = 0; i < count; i++) {
-      parseByte(temp[i]);
+  if (!client || !client.connected()) {
+    client = server.available();
+    if (client) {
+      Serial.println("CLIENT CONNECTED!"); 
+      tft.println("CLIENT CONNECTED!");
+      delay(1000);
+      tft.fillScreen(ST77XX_BLACK);
     }
+    return;
+  }
+
+  while (client.available()) {
+    uint8_t byte = client.read();
+    // Feed directly into your existing packet parser
+    parseByte(byte);
   }
 }
 
@@ -160,14 +184,14 @@ void handlePlayback(uint8_t* data, uint16_t len) {
 
 void handleTimeline(uint8_t* data, uint16_t len) {
   uint16_t idx = 0;
-  if (len!=4) return;
-  uint16_t pos; memcpy(&pos, data, 2);
-  uint16_t dur; memcpy(&dur, data+2, 2);
+  if (len!=8) return;
+  uint32_t pos; memcpy(&pos, data, 4);
+  uint32_t dur; memcpy(&dur, data+4, 4);
   if(dur==0) return;
 
   
 
-  uint16_t width = ((uint32_t)pos * 240) / dur;
+  uint32_t width = ((uint64_t)pos * 240) / dur;
 
   // 5. Clamp width just in case
   if (width > 240) width = 240;
